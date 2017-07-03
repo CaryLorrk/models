@@ -215,6 +215,11 @@ tf.app.flags.DEFINE_boolean(
     'ignore_missing_vars', False,
     'When restoring a checkpoint would ignore missing variables.')
 
+tf.app.flags.DEFINE_string(
+    'woops_config_file', 'config.in',
+    'Woops configure file'
+)
+
 FLAGS = tf.app.flags.FLAGS
 
 
@@ -380,6 +385,8 @@ def main(_):
   if not FLAGS.dataset_dir:
     raise ValueError('You must supply the dataset directory with --dataset_dir')
 
+  print(FLAGS.woops_config_file)
+  tf.woops_initialize_from_file(FLAGS.woops_config_file)
   tf.logging.set_verbosity(tf.logging.INFO)
   with tf.Graph().as_default():
     #######################
@@ -452,7 +459,8 @@ def main(_):
       """Allows data parallelism by creating multiple clones of network_fn."""
       with tf.device(deploy_config.inputs_device()):
         images, labels = batch_queue.dequeue()
-      logits, end_points = network_fn(images)
+      with tf.variable_scope('Woops'):
+        logits, end_points = network_fn(images)
 
       #############################
       # Specify the loss function #
