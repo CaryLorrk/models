@@ -18,12 +18,14 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import sys
 import tensorflow as tf
 
 from datasets import dataset_factory
 from deployment import model_deploy
 from nets import nets_factory
 from preprocessing import preprocessing_factory
+
 
 slim = tf.contrib.slim
 
@@ -459,8 +461,8 @@ def main(_):
       """Allows data parallelism by creating multiple clones of network_fn."""
       with tf.device(deploy_config.inputs_device()):
         images, labels = batch_queue.dequeue()
-      with tf.variable_scope('Woops'):
-        logits, end_points = network_fn(images)
+
+      logits, end_points = network_fn(images)
 
       #############################
       # Specify the loss function #
@@ -559,6 +561,8 @@ def main(_):
     # Merge all summaries together.
     summary_op = tf.summary.merge(list(summaries), name='summary_op')
 
+    for var in tf.trainable_variables():
+        tf.woops_register_trainable(str(var.name[:-2]))
 
     ###########################
     # Kicks off the training. #
@@ -573,6 +577,7 @@ def main(_):
         number_of_steps=FLAGS.max_number_of_steps,
         log_every_n_steps=FLAGS.log_every_n_steps,
         save_summaries_secs=FLAGS.save_summaries_secs,
+        saver=tf.train.Saver(max_to_keep=2000000000),
         save_interval_secs=FLAGS.save_interval_secs,
         sync_optimizer=optimizer if FLAGS.sync_replicas else None)
 

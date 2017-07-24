@@ -18,8 +18,17 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import os
 import math
+import glob
+import re
+import time
+import errno
+import shutil
+import tempfile
 import tensorflow as tf
+from tensorflow.core.framework import summary_pb2
+from tensorflow.core.util import event_pb2
 
 from datasets import dataset_factory
 from nets import nets_factory
@@ -38,9 +47,8 @@ tf.app.flags.DEFINE_string(
     'master', '', 'The address of the TensorFlow master to use.')
 
 tf.app.flags.DEFINE_string(
-    'checkpoint_path', '/tmp/tfmodel/',
-    'The directory where the model was written to or an absolute path to a '
-    'checkpoint file.')
+    'checkpoint_dir', '/tmp/tfmodel/',
+    'The directory where the model was written to.')
 
 tf.app.flags.DEFINE_string(
     'eval_dir', '/tmp/tfmodel/', 'Directory where the results are saved to.')
@@ -83,109 +91,148 @@ FLAGS = tf.app.flags.FLAGS
 
 
 def main(_):
-  if not FLAGS.dataset_dir:
-    raise ValueError('You must supply the dataset directory with --dataset_dir')
+    if not FLAGS.dataset_dir:
+        raise ValueError(
+            'You must supply the dataset directory with --dataset_dir')
+    if not tf.gfile.IsDirectory(FLAGS.checkpoint_dir):
+        raise ValueError(
+            'You must supply the checkpoint directory with --checkpoint_dir')
+    if os.path.exists(FLAGS.eval_dir):
+        raise ValueError('eval_dir exists')
 
-  tf.logging.set_verbosity(tf.logging.INFO)
-  with tf.Graph().as_default():
-    tf_global_step = slim.get_or_create_global_step()
+    tf.logging.set_verbosity(tf.logging.INFO)
+    with tf.Graph().as_default():
+        tf_global_step = slim.get_or_create_global_step()
 
-    ######################
-    # Select the dataset #
-    ######################
-    dataset = dataset_factory.get_dataset(
-        FLAGS.dataset_name, FLAGS.dataset_split_name, FLAGS.dataset_dir)
+        ######################
+        # Select the dataset #
+        ######################
+        dataset = dataset_factory.get_dataset(
+            FLAGS.dataset_name, FLAGS.dataset_split_name, FLAGS.dataset_dir)
 
-    ####################
-    # Select the model #
-    ####################
-    network_fn = nets_factory.get_network_fn(
-        FLAGS.model_name,
-        num_classes=(dataset.num_classes - FLAGS.labels_offset),
-        is_training=False)
+        ####################
+        # Select the model #
+        ####################
+        network_fn = nets_factory.get_network_fn(
+            FLAGS.model_name,
+            num_classes=(dataset.num_classes - FLAGS.labels_offset),
+            is_training=False)
 
-    ##############################################################
-    # Create a dataset provider that loads data from the dataset #
-    ##############################################################
-    provider = slim.dataset_data_provider.DatasetDataProvider(
-        dataset,
-        shuffle=False,
-        common_queue_capacity=2 * FLAGS.batch_size,
-        common_queue_min=FLAGS.batch_size)
-    [image, label] = provider.get(['image', 'label'])
-    label -= FLAGS.labels_offset
+        ##############################################################
+        # Create a dataset provider that loads data from the dataset #
+        ##############################################################
+        provider = slim.dataset_data_provider.DatasetDataProvider(
+            dataset,
+            shuffle=False,
+            common_queue_capacity=2 * FLAGS.batch_size,
+            common_queue_min=FLAGS.batch_size)
+        [image, label] = provider.get(['image', 'label'])
+        label -= FLAGS.labels_offset
 
-    #####################################
-    # Select the preprocessing function #
-    #####################################
-    preprocessing_name = FLAGS.preprocessing_name or FLAGS.model_name
-    image_preprocessing_fn = preprocessing_factory.get_preprocessing(
-        preprocessing_name,
-        is_training=False)
+        #####################################
+        # Select the preprocessing function #
+        #####################################
+        preprocessing_name = FLAGS.preprocessing_name or FLAGS.model_name
+        image_preprocessing_fn = preprocessing_factory.get_preprocessing(
+            preprocessing_name,
+            is_training=False)
 
-    eval_image_size = FLAGS.eval_image_size or network_fn.default_image_size
+        eval_image_size = FLAGS.eval_image_size or network_fn.default_image_size
 
-    image = image_preprocessing_fn(image, eval_image_size, eval_image_size)
+        image = image_preprocessing_fn(image, eval_image_size, eval_image_size)
 
-    images, labels = tf.train.batch(
-        [image, label],
-        batch_size=FLAGS.batch_size,
-        num_threads=FLAGS.num_preprocessing_threads,
-        capacity=5 * FLAGS.batch_size)
+        images, labels = tf.train.batch(
+            [image, label],
+            batch_size=FLAGS.batch_size,
+            num_threads=FLAGS.num_preprocessing_threads,
+            capacity=5 * FLAGS.batch_size)
 
-    ####################
-    # Define the model #
-    ####################
-    logits, _ = network_fn(images)
+        ####################
+        # Define the model #
+        ####################
+        logits, _ = network_fn(images)
 
-    if FLAGS.moving_average_decay:
-      variable_averages = tf.train.ExponentialMovingAverage(
-          FLAGS.moving_average_decay, tf_global_step)
-      variables_to_restore = variable_averages.variables_to_restore(
-          slim.get_model_variables())
-      variables_to_restore[tf_global_step.op.name] = tf_global_step
-    else:
-      variables_to_restore = slim.get_variables_to_restore()
+        if FLAGS.moving_average_decay:
+            variable_averages = tf.train.ExponentialMovingAverage(
+                FLAGS.moving_average_decay, tf_global_step)
+            variables_to_restore = variable_averages.variables_to_restore(
+                slim.get_model_variables())
+            variables_to_restore[tf_global_step.op.name] = tf_global_step
+        else:
+            variables_to_restore = slim.get_variables_to_restore()
 
-    predictions = tf.argmax(logits, 1)
-    labels = tf.squeeze(labels)
+        predictions = tf.argmax(logits, 1)
+        labels = tf.squeeze(labels)
 
-    # Define the metrics:
-    names_to_values, names_to_updates = slim.metrics.aggregate_metric_map({
-        'Accuracy': slim.metrics.streaming_accuracy(predictions, labels),
-        'Recall_5': slim.metrics.streaming_recall_at_k(
-            logits, labels, 5),
-    })
+        # Define the metrics:
+        names_to_values, names_to_updates = slim.metrics.aggregate_metric_map({
+            'Accuracy': slim.metrics.streaming_accuracy(predictions, labels),
+            'Recall_5': slim.metrics.streaming_recall_at_k(
+                logits, labels, 5),
+        })
 
-    # Print the summaries to screen.
-    for name, value in names_to_values.items():
-      summary_name = 'eval/%s' % name
-      op = tf.summary.scalar(summary_name, value, collections=[])
-      op = tf.Print(op, [value], summary_name)
-      tf.add_to_collection(tf.GraphKeys.SUMMARIES, op)
+        # Print the summaries to screen.
+        for name, value in names_to_values.items():
+            summary_name = 'eval/%s' % name
+            op = tf.summary.scalar(summary_name, value, collections=[])
+            op = tf.Print(op, [value], summary_name)
+            tf.add_to_collection(tf.GraphKeys.SUMMARIES, op)
 
-    # TODO(sguada) use num_epochs=1
-    if FLAGS.max_num_batches:
-      num_batches = FLAGS.max_num_batches
-    else:
-      # This ensures that we make a single pass over all of the data.
-      num_batches = math.ceil(dataset.num_samples / float(FLAGS.batch_size))
+        # TODO(sguada) use num_epochs=1
+        if FLAGS.max_num_batches:
+            num_batches = FLAGS.max_num_batches
+        else:
+            # This ensures that we make a single pass over all of the data.
+            num_batches = math.ceil(
+                dataset.num_samples /
+                float(
+                    FLAGS.batch_size))
 
-    if tf.gfile.IsDirectory(FLAGS.checkpoint_path):
-      checkpoint_path = tf.train.latest_checkpoint(FLAGS.checkpoint_path)
-    else:
-      checkpoint_path = FLAGS.checkpoint_path
+        writer = tf.summary.FileWriter(FLAGS.eval_dir)
+        writer.add_event(
+            event_pb2.Event(
+                wall_time=0,
+                file_version="brain.Event:2"))
+        prog = re.compile(".*model.ckpt-(?P<wall_time>\d+.\d+)-(?P<step>\d+)")
+        checkpoint_state = tf.train.get_checkpoint_state(FLAGS.checkpoint_dir)
+        for checkpoint_path in checkpoint_state.all_model_checkpoint_paths:
+            try:
+                temp_eval_dir = tempfile.mkdtemp()
+                tf.logging.info('Evaluating %s' % checkpoint_path)
+                slim.evaluation.evaluate_once(
+                    master=FLAGS.master,
+                    checkpoint_path=checkpoint_path,
+                    logdir=temp_eval_dir,
+                    num_evals=num_batches,
+                    eval_op=list(names_to_updates.values()),
+                    variables_to_restore=variables_to_restore)
 
-    tf.logging.info('Evaluating %s' % checkpoint_path)
+                temp_event_file = glob.glob(
+                    os.path.join(temp_eval_dir, 'events.out*'))[0]
+                for event in tf.train.summary_iterator(temp_event_file):
+                    for value in event.summary.value:
+                        if value.tag == 'eval/Accuracy':
+                            accuracy = value
+                        if value.tag == 'eval/Recall_5':
+                            recall = value
+            finally:
+                try:
+                    shutil.rmtree(temp_eval_dir)
+                except OSError as e:
+                    if e.errno != errno.ENOENT:
+                        raise
 
-    slim.evaluation.evaluate_once(
-        master=FLAGS.master,
-        checkpoint_path=checkpoint_path,
-        logdir=FLAGS.eval_dir,
-        num_evals=num_batches,
-        eval_op=list(names_to_updates.values()),
-        variables_to_restore=variables_to_restore)
+            m = prog.match(checkpoint_path)
+            wall_time = float(m.group('wall_time'))
+            step = int(m.group('step'))
+
+            summary = summary_pb2.Summary(value=[accuracy, recall])
+            writer.add_event(
+                event_pb2.Event(
+                    wall_time=wall_time,
+                    step=step,
+                    summary=summary))
 
 
 if __name__ == '__main__':
-  tf.app.run()
+    tf.app.run()
