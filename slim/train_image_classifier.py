@@ -62,6 +62,10 @@ tf.app.flags.DEFINE_integer(
     'The frequency with which logs are print.')
 
 tf.app.flags.DEFINE_integer(
+    'trace_every_n_steps', 10,
+    'The frequency with which traces are write.')
+
+tf.app.flags.DEFINE_integer(
     'save_summaries_secs', 600,
     'The frequency with which summaries are saved, in seconds.')
 
@@ -564,6 +568,16 @@ def main(_):
     for var in tf.trainable_variables():
         tf.woops_register_trainable(str(var.name[:-2]))
 
+    # total_parameters = 0
+    # for variable in tf.trainable_variables():
+        # shape is an array of tf.Dimension
+        # shape = variable.get_shape()
+        # variable_parameters = 1
+        # for dim in shape:
+            # variable_parameters *= dim.value
+        # total_parameters += variable_parameters
+    # print(total_parameters)
+
     ###########################
     # Kicks off the training. #
     ###########################
@@ -576,6 +590,7 @@ def main(_):
         summary_op=summary_op,
         number_of_steps=FLAGS.max_number_of_steps,
         log_every_n_steps=FLAGS.log_every_n_steps,
+        trace_every_n_steps=(None if not FLAGS.trace_every_n_steps else FLAGS.trace_every_n_steps),
         save_summaries_secs=FLAGS.save_summaries_secs,
         saver=tf.train.Saver(max_to_keep=2000000000),
         save_interval_secs=FLAGS.save_interval_secs,
